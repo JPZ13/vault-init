@@ -457,15 +457,21 @@ func getAgeIdentities(ctx context.Context) ([]age.Identity, error) {
 	identitiesStr := string(identitiesBytes)
 	log.Printf("Retrieved AGE_IDENTITIES from secret %s/%s", k8sNamespace, ageIdentitiesSecretName)
 
-	// Parse age identities (comma-separated list of private keys)
-	identitiesList := strings.Split(identitiesStr, ",")
-	identities := make([]age.Identity, 0, len(identitiesList))
-	for _, identityStr := range identitiesList {
-		identityStr = strings.TrimSpace(identityStr)
-		if identityStr == "" {
+	// Parse age identities - handle both single keys and age identity file format
+	// Age identity files can have comments (lines starting with #) and multiple keys
+	identities := make([]age.Identity, 0)
+
+	// Split by newlines to handle age identity file format
+	lines := strings.Split(identitiesStr, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		identity, err := age.ParseX25519Identity(identityStr)
+
+		// Try to parse as age identity
+		identity, err := age.ParseX25519Identity(line)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse age identity: %w", err)
 		}
