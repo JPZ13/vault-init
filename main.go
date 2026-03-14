@@ -96,6 +96,7 @@ func main() {
 	vaultInsecureSkipVerify := boolFromEnv("VAULT_SKIP_VERIFY", false)
 
 	vaultAutoUnseal := boolFromEnv("VAULT_AUTO_UNSEAL", true)
+	vaultRaftEnabled := boolFromEnv("VAULT_RAFT_ENABLED", false)
 
 	if vaultAutoUnseal {
 		vaultStoredShares = intFromEnv("VAULT_STORED_SHARES", 1)
@@ -196,10 +197,10 @@ func main() {
 		},
 	}
 
-	runner(ctx, checkInterval, vaultAutoUnseal)
+	runner(ctx, checkInterval, vaultAutoUnseal, vaultRaftEnabled)
 }
 
-func runner(ctx context.Context, checkInterval time.Duration, vaultAutoUnseal bool) {
+func runner(ctx context.Context, checkInterval time.Duration, vaultAutoUnseal bool, vaultRaftEnabled bool) {
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -226,7 +227,7 @@ func runner(ctx context.Context, checkInterval time.Duration, vaultAutoUnseal bo
 			continue
 		}
 
-		handleResponseCode(ctx, response.StatusCode, vaultAutoUnseal)
+		handleResponseCode(ctx, response.StatusCode, vaultAutoUnseal, vaultRaftEnabled)
 
 		if checkInterval <= 0 {
 			log.Printf("Check interval set to less than 0, exiting.")
@@ -243,7 +244,7 @@ func runner(ctx context.Context, checkInterval time.Duration, vaultAutoUnseal bo
 	}
 }
 
-func handleResponseCode(ctx context.Context, code int, vaultAutoUnseal bool) {
+func handleResponseCode(ctx context.Context, code int, vaultAutoUnseal bool, vaultRaftEnabled bool) {
 	switch code {
 	case http.StatusOK:
 		log.Println("Vault is initialized and unsealed.")
@@ -251,23 +252,29 @@ func handleResponseCode(ctx context.Context, code int, vaultAutoUnseal bool) {
 		log.Println("Vault is unsealed and in standby mode.")
 	case http.StatusNotImplemented:
 		log.Println("Vault is not initialized.")
-		// Check if we should initialize (only vault-0 in a Raft cluster)
+		// Check if Raft clustering is enabled and we're not vault-0
 		hostname := os.Getenv("HOSTNAME")
-		if hostname != "" && hostname != "vault-0" {
-			// Not vault-0, wait for vault-0 to initialize and create secrets file
+		if vaultRaftEnabled && hostname != "" && hostname != "vault-0" {
+			// Raft mode: Not vault-0, wait for vault-0 to initialize and create secrets file
 			log.Printf("Pod %s waiting for vault-0 to initialize and create secrets file...", hostname)
 			if _, err := os.Stat(secretFilePath); os.IsNotExist(err) {
 				log.Println("Secrets file does not exist yet, will retry on next check")
 				return
 			}
-			// Secrets file exists, proceed to unseal
-			log.Println("Secrets file found, proceeding to unseal")
+			// Secrets file exists, join the Raft cluster
+			log.Println("Secrets file found, joining Raft cluster...")
+			if err := joinRaftCluster(ctx); err != nil {
+				log.Printf("failed to join Raft cluster: %v", err)
+				return
+			}
+			log.Println("Successfully joined Raft cluster")
+			// After joining, unseal
 			if !vaultAutoUnseal {
 				log.Println("Unsealing...")
 				unseal(ctx)
 			}
 		} else {
-			// vault-0 or no hostname set, proceed with initialization
+			// Non-Raft mode or vault-0: proceed with initialization
 			log.Println("Initializing...")
 			initialize(ctx)
 			if !vaultAutoUnseal {
@@ -371,6 +378,47 @@ func unseal(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// joinRaftCluster joins this Vault node to the Raft cluster leader (vault-0)
+func joinRaftCluster(ctx context.Context) error {
+	hostname := os.Getenv("HOSTNAME")
+	if hostname == "" {
+		return fmt.Errorf("HOSTNAME environment variable not set")
+	}
+
+	// Construct the join request
+	leaderAPIAddr := "http://vault-0.vault-internal:8200"
+	joinData := map[string]interface{}{
+		"leader_api_addr": leaderAPIAddr,
+		"leader_ca_cert":  "",
+	}
+
+	joinDataBytes, err := json.Marshal(joinData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal join data: %w", err)
+	}
+
+	// Send join request to local Vault instance
+	r := bytes.NewReader(joinDataBytes)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, vaultAddr+"/v1/sys/storage/raft/join", r)
+	if err != nil {
+		return fmt.Errorf("failed to create join request: %w", err)
+	}
+
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("failed to send join request: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("join request failed with status %d: %s", response.StatusCode, string(bodyBytes))
+	}
+
+	log.Printf("Pod %s successfully joined Raft cluster at %s", hostname, leaderAPIAddr)
+	return nil
 }
 
 func unsealOne(ctx context.Context, key string) (bool, error) {
