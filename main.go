@@ -251,11 +251,29 @@ func handleResponseCode(ctx context.Context, code int, vaultAutoUnseal bool) {
 		log.Println("Vault is unsealed and in standby mode.")
 	case http.StatusNotImplemented:
 		log.Println("Vault is not initialized.")
-		log.Println("Initializing...")
-		initialize(ctx)
-		if !vaultAutoUnseal {
-			log.Println("Unsealing...")
-			unseal(ctx)
+		// Check if we should initialize (only vault-0 in a Raft cluster)
+		hostname := os.Getenv("HOSTNAME")
+		if hostname != "" && hostname != "vault-0" {
+			// Not vault-0, wait for vault-0 to initialize and create secrets file
+			log.Printf("Pod %s waiting for vault-0 to initialize and create secrets file...", hostname)
+			if _, err := os.Stat(secretFilePath); os.IsNotExist(err) {
+				log.Println("Secrets file does not exist yet, will retry on next check")
+				return
+			}
+			// Secrets file exists, proceed to unseal
+			log.Println("Secrets file found, proceeding to unseal")
+			if !vaultAutoUnseal {
+				log.Println("Unsealing...")
+				unseal(ctx)
+			}
+		} else {
+			// vault-0 or no hostname set, proceed with initialization
+			log.Println("Initializing...")
+			initialize(ctx)
+			if !vaultAutoUnseal {
+				log.Println("Unsealing...")
+				unseal(ctx)
+			}
 		}
 	case http.StatusServiceUnavailable:
 		log.Println("Vault is sealed.")
