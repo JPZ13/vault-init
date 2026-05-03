@@ -343,7 +343,7 @@ func initialize(ctx context.Context) {
 	log.Println("Encrypting unseal keys and the root token with age...")
 
 	// Encrypt and save to filesystem
-	if err := encryptAndSaveSecrets(initRequestResponseBody); err != nil {
+	if err := encryptAndSaveSecrets(ctx, initRequestResponseBody); err != nil {
 		log.Printf("failed to encrypt and save secrets: %v", err)
 		return
 	}
@@ -465,7 +465,26 @@ func unsealOne(ctx context.Context, key string) (bool, error) {
 }
 
 // encryptAndSaveSecrets encrypts the vault secrets using age and saves them to the filesystem
-func encryptAndSaveSecrets(data []byte) error {
+func encryptAndSaveSecrets(ctx context.Context, data []byte) error {
+	// Get age identities from Kubernetes secret
+	identities, err := getAgeIdentities(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get age identities: %w", err)
+	}
+
+	// Derive recipients (public keys) from identities (private keys)
+	recipients := make([]age.Recipient, 0, len(identities))
+	for _, identity := range identities {
+		// age.X25519Identity has a Recipient() method that returns the public key
+		if x25519Identity, ok := identity.(*age.X25519Identity); ok {
+			recipients = append(recipients, x25519Identity.Recipient())
+		}
+	}
+
+	if len(recipients) == 0 {
+		return fmt.Errorf("no valid recipients derived from identities")
+	}
+
 	// Create a temporary file for atomic write
 	tmpFile := secretFilePath + ".tmp"
 
@@ -478,8 +497,8 @@ func encryptAndSaveSecrets(data []byte) error {
 		_ = os.Remove(tmpFile)
 	}()
 
-	// Create age writer
-	w, err := age.Encrypt(f, ageRecipients...)
+	// Create age writer using recipients derived from identities
+	w, err := age.Encrypt(f, recipients...)
 	if err != nil {
 		return fmt.Errorf("failed to create age encryptor: %w", err)
 	}
